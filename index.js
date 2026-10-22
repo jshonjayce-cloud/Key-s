@@ -1,4 +1,4 @@
-```javascript
+
 const {
     Client,
     GatewayIntentBits,
@@ -8,12 +8,16 @@ const {
 } = require("discord.js");
 
 const Database = require("better-sqlite3");
+const express = require("express");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const REQUIRED_ROLE_NAME = "Buyers Mobile <3";
+const PORT = Number(process.env.PORT) || 10000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "keys.db");
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
@@ -101,7 +105,6 @@ const keys = [
     "lPWdeN2LHLUD1q8fQAvB5XIU1RL1",
     "DL7O8FlNQoyQ6CvXWlUjgIJmX6uq",
     "gThUYnG97lgsllnZ5zXMeDJ3JvM9",
-    "klGYB3bLSk0DKIvPOBnuIxlatbrN",
     "ExFvQEYYfdn4y35usK5ladx8humE",
     "0w0CZfXzRqtZSYAH4lji3PBDzEMJ",
     "0K1pQKkEvFbWkGTns5CQW5QKRpiH",
@@ -154,27 +157,108 @@ const keys = [
     "mTbPRsHDNjVbMNNhIW1jvgzxSBaY"
 ];
 
-const wasSeeded = db.prepare(
+const seeded = db.prepare(
     "SELECT value FROM database_settings WHERE key = 'seeded'"
 );
 
-if (!wasSeeded.get()) {
-    const seed = db.transaction(() => {
+if (!seeded.get()) {
+    db.transaction(() => {
         const insert = db.prepare(
             "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
         );
 
-        for (const key of keys) insert.run(key);
+        for (const key of keys) {
+            insert.run(key);
+        }
 
         db.prepare(
             "INSERT INTO database_settings (key, value) VALUES ('seeded', '1')"
         ).run();
-    });
-
-    seed();
+    })();
 }
 
-const command = new SlashCommandBuilder()
+// Remove this key from existing databases as well.
+db.prepare(
+    "DELETE FROM available_keys WHERE key = ?"
+).run("klGYB3bLSk0DKIvPOBnuIxlatbrN");
+
+// ---------------- WEB SERVER ----------------
+
+const app = express();
+
+app.get("/", (_req, res) => {
+    res.status(200).send("🎃 vivians is running 🦇");
+});
+
+app.get("/health", (_req, res) => {
+    res.status(200).json({
+        status: "ok",
+        bot: "vivians",
+        discord: client.isReady()
+    });
+});
+
+const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[WEB] Listening on port ${PORT}`);
+});
+
+// ---------------- KEEP ALIVE ----------------
+
+const KEEP_ALIVE_INTERVAL = 5 * 60 * 1000;
+
+function startKeepAlive() {
+    const baseUrl = (
+        process.env.RENDER_EXTERNAL_URL ||
+        `http://localhost:${PORT}`
+    ).replace(/\/+$/, "");
+
+    const healthUrl = `${baseUrl}/health`;
+    const mod = healthUrl.startsWith("https://") ? https : http;
+
+    setInterval(() => {
+        const req = mod.get(healthUrl, { timeout: 5000 }, (res) => {
+            let data = "";
+
+            res.on("data", (chunk) => {
+                data += chunk;
+            });
+
+            res.on("end", () => {
+                try {
+                    const json = JSON.parse(data);
+
+                    if (res.statusCode === 200 && json.status === "ok") {
+                        console.log(
+                            "[KEEP-ALIVE] Ping successful — " +
+                            new Date().toLocaleTimeString()
+                        );
+                    } else {
+                        console.log(
+                            "[KEEP-ALIVE] Unexpected response:",
+                            res.statusCode
+                        );
+                    }
+                } catch {
+                    console.log("[KEEP-ALIVE] Invalid health response.");
+                }
+            });
+        });
+
+        req.on("timeout", () => {
+            req.destroy(new Error("keep-alive timeout"));
+        });
+
+        req.on("error", (err) => {
+            console.log("[KEEP-ALIVE] Ping failed: " + err.message);
+        });
+    }, KEEP_ALIVE_INTERVAL);
+}
+
+startKeepAlive();
+
+// ---------------- DISCORD BOT ----------------
+
+const generateKeyCommand = new SlashCommandBuilder()
     .setName("generatekey")
     .setDescription("Get one unused Mobile key.");
 
@@ -193,9 +277,11 @@ const saveRedeemed = db.prepare(`
 
 const claimKey = db.transaction((userId) => {
     const entry = selectKey.get();
+
     if (!entry) return null;
 
     const result = deleteKey.run(entry.key);
+
     if (result.changes !== 1) return null;
 
     saveRedeemed.run(
@@ -207,15 +293,19 @@ const claimKey = db.transaction((userId) => {
     return entry.key;
 });
 
+const restoreKey = db.prepare(
+    "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
+);
+
 async function registerCommands() {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
 
     await rest.put(
         Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-        { body: [command.toJSON()] }
+        { body: [generateKeyCommand.toJSON()] }
     );
 
-    console.log("Slash commands registered.");
+    console.log("[DISCORD] /generatekey registered.");
 }
 
 client.on("interactionCreate", async (interaction) => {
@@ -226,7 +316,9 @@ client.on("interactionCreate", async (interaction) => {
 
     try {
         if (!interaction.inGuild()) {
-            return interaction.editReply("Use this command in the server.");
+            return interaction.editReply(
+                "Use this command in the server."
+            );
         }
 
         const member = await interaction.guild.members.fetch(
@@ -251,17 +343,18 @@ client.on("interactionCreate", async (interaction) => {
 
         try {
             await interaction.user.send(
-                `Your Mobile key:\n\`\`\`\n${key}\n\`\`\``
+                "🎃 **Vivian's Mobile Key** 🦇\n\n" +
+                `\`\`\`\n${key}\n\`\`\`\n` +
+                "Keep your key private."
             );
-        } catch {
+        } catch (error) {
+            // Return the key to stock if delivery fails.
             db.transaction(() => {
                 db.prepare(
                     "DELETE FROM redeemed_keys WHERE key = ?"
                 ).run(key);
 
-                db.prepare(
-                    "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
-                ).run(key);
+                restoreKey.run(key);
             })();
 
             return interaction.editReply(
@@ -269,23 +362,29 @@ client.on("interactionCreate", async (interaction) => {
             );
         }
 
-        await interaction.editReply("Check your DMs for your key.");
-        console.log(`Key sent to ${interaction.user.tag}`);
-    } catch (error) {
-        console.error(error);
         await interaction.editReply(
-            "An error occurred while generating your key."
+            "Check your DMs! Your key was sent privately."
+        );
+
+        console.log(
+            `[KEY] Sent a key to ${interaction.user.tag} (${interaction.user.id}).`
+        );
+    } catch (error) {
+        console.error("[KEY ERROR]", error);
+
+        await interaction.editReply(
+            "Something went wrong while generating your key."
         ).catch(() => {});
     }
 });
 
 client.once("ready", () => {
-    console.log(`Logged in as ${client.user.tag}`);
-    console.log(
-        `Keys remaining: ${db.prepare(
-            "SELECT COUNT(*) AS count FROM available_keys"
-        ).get().count}`
-    );
+    const remaining = db.prepare(
+        "SELECT COUNT(*) AS count FROM available_keys"
+    ).get().count;
+
+    console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+    console.log(`[KEYS] ${remaining} unused keys remaining.`);
 });
 
 async function start() {
@@ -293,16 +392,29 @@ async function start() {
         await registerCommands();
         await client.login(TOKEN);
     } catch (error) {
-        console.error("Startup failed:", error);
+        console.error("[STARTUP ERROR]", error);
         process.exit(1);
     }
 }
 
-process.on("SIGTERM", () => {
+async function shutdown() {
+    console.log("[SHUTDOWN] Closing services.");
+
+    clearInterval(keepAliveTimer);
+    server.close();
+
+    if (client.isReady()) {
+        client.destroy();
+    }
+
     db.close();
-    client.destroy();
     process.exit(0);
-});
+}
+
+// Store the timer so it can be stopped during shutdown.
+const keepAliveTimer = setInterval(() => {}, 2147483647);
+
+process.once("SIGTERM", shutdown);
+process.once("SIGINT", shutdown);
 
 start();
-```
