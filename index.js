@@ -300,13 +300,13 @@ client.on("interactionCreate", async (interaction) => {
 
     try {
         await interaction.user.send(
-            `🔑 **Your key**\n\n\`${nextKey.key}\`\n\nKeep this key private.`
+            ` **your key <3**\n\n\`${nextKey.key}\`\n\n**warning this key is only for you**.`
         );
     } catch (error) {
         console.error("[KEYGEN] Could not DM user:", error.message);
 
         return interaction.editReply(
-            "❌ I couldn't DM you. Enable server-member DMs and try again. Your key was not used."
+            "❌ Turn on direct messages"
         );
     }
 
