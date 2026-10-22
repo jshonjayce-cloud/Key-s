@@ -1,4 +1,3 @@
-
 const {
     Client,
     GatewayIntentBits,
@@ -13,29 +12,30 @@ const http = require("http");
 const https = require("https");
 const path = require("path");
 
-const TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
-const REQUIRED_ROLE_NAME = "Buyers Mobile <3";
 const PORT = Number(process.env.PORT) || 10000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "keys.db");
 
-if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-    console.error("Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID.");
+const ALLOWED_ROLE_ID = "1554321313332469800";
+const REMOVED_KEY = "klGYB3bLSk0DKIvPOBnuIxlatbrN";
+
+if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
+    console.error("[ERROR] Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID.");
     process.exit(1);
 }
 
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers
-    ]
+    intents: [GatewayIntentBits.Guilds]
 });
+
+const app = express();
+app.use(express.json());
 
 const db = new Database(DB_PATH);
 
 db.pragma("journal_mode = WAL");
-db.pragma("busy_timeout = 5000");
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS available_keys (
@@ -55,7 +55,7 @@ db.exec(`
     );
 `);
 
-const keys = [
+const KEYS = [
     "ba07siZe47NfMRBwZcQsnPeZ2V12",
     "dbn4GETInxdLclaVwkonnXkkgSyE",
     "OvdeUnImHlxtIGden7IOXmJubfAG",
@@ -157,40 +157,67 @@ const keys = [
     "mTbPRsHDNjVbMNNhIW1jvgzxSBaY"
 ];
 
+// Remove the excluded key from existing databases.
+db.prepare("DELETE FROM available_keys WHERE key = ?").run(REMOVED_KEY);
+db.prepare("DELETE FROM redeemed_keys WHERE key = ?").run(REMOVED_KEY);
+
+// Seed the database only once.
 const seeded = db.prepare(
     "SELECT value FROM database_settings WHERE key = 'seeded'"
-);
+).get();
 
-if (!seeded.get()) {
-    db.transaction(() => {
-        const insert = db.prepare(
-            "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
-        );
+if (!seeded) {
+    const insertKey = db.prepare(
+        "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
+    );
 
-        for (const key of keys) {
-            insert.run(key);
+    const seedTransaction = db.transaction(() => {
+        for (const key of KEYS) {
+            if (key !== REMOVED_KEY) {
+                insertKey.run(key);
+            }
         }
 
-        db.prepare(
-            "INSERT INTO database_settings (key, value) VALUES ('seeded', '1')"
-        ).run();
-    })();
+        db.prepare(`
+            INSERT OR REPLACE INTO database_settings (key, value)
+            VALUES ('seeded', 'true')
+        `).run();
+    });
+
+    seedTransaction();
 }
 
-// Remove this key from existing databases as well.
-db.prepare(
-    "DELETE FROM available_keys WHERE key = ?"
-).run("klGYB3bLSk0DKIvPOBnuIxlatbrN");
+const getNextKey = db.prepare(`
+    SELECT id, key
+    FROM available_keys
+    ORDER BY id ASC
+    LIMIT 1
+`);
 
-// ---------------- WEB SERVER ----------------
+const removeAvailableKey = db.prepare(
+    "DELETE FROM available_keys WHERE id = ?"
+);
 
-const app = express();
+const restoreKey = db.prepare(
+    "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
+);
 
-app.get("/", (_req, res) => {
+const saveRedeemedKey = db.prepare(`
+    INSERT INTO redeemed_keys (key, user_id, redeemed_at)
+    VALUES (?, ?, ?)
+`);
+
+const generateCommand = new SlashCommandBuilder()
+    .setName("generatekey")
+    .setDescription("Generate a key and receive it in your DMs.");
+
+const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+app.get("/", (req, res) => {
     res.status(200).send("🎃 vivians is running 🦇");
 });
 
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
     res.status(200).json({
         status: "ok",
         bot: "vivians",
@@ -198,13 +225,9 @@ app.get("/health", (_req, res) => {
     });
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[WEB] Listening on port ${PORT}`);
-});
-
-// ---------------- KEEP ALIVE ----------------
-
-const KEEP_ALIVE_INTERVAL = 5 * 60 * 1000;
+let server;
+let keepAliveTimer;
+let shuttingDown = false;
 
 function startKeepAlive() {
     const baseUrl = (
@@ -212,209 +235,165 @@ function startKeepAlive() {
         `http://localhost:${PORT}`
     ).replace(/\/+$/, "");
 
-    const healthUrl = `${baseUrl}/health`;
-    const mod = healthUrl.startsWith("https://") ? https : http;
+    const requester = baseUrl.startsWith("https://") ? https : http;
 
-    setInterval(() => {
-        const req = mod.get(healthUrl, { timeout: 5000 }, (res) => {
-            let data = "";
+    keepAliveTimer = setInterval(() => {
+        const request = requester.get(`${baseUrl}/health`, (response) => {
+            response.resume();
 
-            res.on("data", (chunk) => {
-                data += chunk;
-            });
-
-            res.on("end", () => {
-                try {
-                    const json = JSON.parse(data);
-
-                    if (res.statusCode === 200 && json.status === "ok") {
-                        console.log(
-                            "[KEEP-ALIVE] Ping successful — " +
-                            new Date().toLocaleTimeString()
-                        );
-                    } else {
-                        console.log(
-                            "[KEEP-ALIVE] Unexpected response:",
-                            res.statusCode
-                        );
-                    }
-                } catch {
-                    console.log("[KEEP-ALIVE] Invalid health response.");
-                }
-            });
+            if (response.statusCode === 200) {
+                console.log("[KEEP-ALIVE] Health check successful.");
+            } else {
+                console.error(
+                    `[KEEP-ALIVE] Health check returned ${response.statusCode}.`
+                );
+            }
         });
 
-        req.on("timeout", () => {
-            req.destroy(new Error("keep-alive timeout"));
-        });
+        request.setTimeout(10000, () => request.destroy());
 
-        req.on("error", (err) => {
-            console.log("[KEEP-ALIVE] Ping failed: " + err.message);
+        request.on("error", (error) => {
+            console.error("[KEEP-ALIVE] Request failed:", error.message);
         });
-    }, KEEP_ALIVE_INTERVAL);
+    }, 5 * 60 * 1000);
+
+    keepAliveTimer.unref();
 }
 
-startKeepAlive();
-
-// ---------------- DISCORD BOT ----------------
-
-const generateKeyCommand = new SlashCommandBuilder()
-    .setName("generatekey")
-    .setDescription("Get one unused Mobile key.");
-
-const selectKey = db.prepare(
-    "SELECT key FROM available_keys ORDER BY id LIMIT 1"
-);
-
-const deleteKey = db.prepare(
-    "DELETE FROM available_keys WHERE key = ?"
-);
-
-const saveRedeemed = db.prepare(`
-    INSERT INTO redeemed_keys (key, user_id, redeemed_at)
-    VALUES (?, ?, ?)
-`);
-
-const claimKey = db.transaction((userId) => {
-    const entry = selectKey.get();
-
-    if (!entry) return null;
-
-    const result = deleteKey.run(entry.key);
-
-    if (result.changes !== 1) return null;
-
-    saveRedeemed.run(
-        entry.key,
-        userId,
-        new Date().toISOString()
-    );
-
-    return entry.key;
+client.once("ready", () => {
+    console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+    console.log(`[KEYS] Available: ${db.prepare(
+        "SELECT COUNT(*) AS count FROM available_keys"
+    ).get().count}`);
 });
-
-const restoreKey = db.prepare(
-    "INSERT OR IGNORE INTO available_keys (key) VALUES (?)"
-);
-
-async function registerCommands() {
-    const rest = new REST({ version: "10" }).setToken(TOKEN);
-
-    await rest.put(
-        Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-        { body: [generateKeyCommand.toJSON()] }
-    );
-
-    console.log("[DISCORD] /generatekey registered.");
-}
 
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== "generatekey") return;
 
+    if (!interaction.inGuild() || !interaction.member) {
+        return interaction.reply({
+            content: "❌ Use this command inside the server.",
+            ephemeral: true
+        });
+    }
+
+    // Only this role can use the key generator.
+    const hasAccess = interaction.member.roles.cache.has(ALLOWED_ROLE_ID);
+
+    if (!hasAccess) {
+        return interaction.reply({
+            content: "❌ You don't have permission to use the key generator.",
+            ephemeral: true
+        });
+    }
+
     await interaction.deferReply({ ephemeral: true });
 
+    const nextKey = getNextKey.get();
+
+    if (!nextKey) {
+        return interaction.editReply(
+            "❌ No keys are available right now."
+        );
+    }
+
     try {
-        if (!interaction.inGuild()) {
-            return interaction.editReply(
-                "Use this command in the server."
-            );
-        }
-
-        const member = await interaction.guild.members.fetch(
-            interaction.user.id
+        await interaction.user.send(
+            `🔑 **Your key**\n\n\`${nextKey.key}\`\n\nKeep this key private.`
         );
+    } catch (error) {
+        console.error("[KEYGEN] Could not DM user:", error.message);
 
-        const hasRole = member.roles.cache.some(
-            role => role.name === REQUIRED_ROLE_NAME
+        return interaction.editReply(
+            "❌ I couldn't DM you. Enable server-member DMs and try again. Your key was not used."
         );
+    }
 
-        if (!hasRole) {
-            return interaction.editReply(
-                `You need the **${REQUIRED_ROLE_NAME}** role to use this command.`
+    try {
+        const transaction = db.transaction(() => {
+            const current = db.prepare(
+                "SELECT id, key FROM available_keys WHERE id = ?"
+            ).get(nextKey.id);
+
+            if (!current || current.key !== nextKey.key) {
+                throw new Error("Key is no longer available.");
+            }
+
+            removeAvailableKey.run(nextKey.id);
+
+            saveRedeemedKey.run(
+                nextKey.key,
+                interaction.user.id,
+                new Date().toISOString()
             );
-        }
+        });
 
-        const key = claimKey(interaction.user.id);
-
-        if (!key) {
-            return interaction.editReply("No unused keys are left.");
-        }
-
-        try {
-            await interaction.user.send(
-                "🎃 **Vivian's Mobile Key** 🦇\n\n" +
-                `\`\`\`\n${key}\n\`\`\`\n` +
-                "Keep your key private."
-            );
-        } catch (error) {
-            // Return the key to stock if delivery fails.
-            db.transaction(() => {
-                db.prepare(
-                    "DELETE FROM redeemed_keys WHERE key = ?"
-                ).run(key);
-
-                restoreKey.run(key);
-            })();
-
-            return interaction.editReply(
-                "I couldn't DM you. Enable DMs from server members and try again."
-            );
-        }
+        transaction();
 
         await interaction.editReply(
-            "Check your DMs! Your key was sent privately."
+            "✅ Your key was sent to your DMs."
         );
 
         console.log(
-            `[KEY] Sent a key to ${interaction.user.tag} (${interaction.user.id}).`
+            `[KEYGEN] Key issued to Discord user ${interaction.user.id}`
         );
     } catch (error) {
-        console.error("[KEY ERROR]", error);
+        console.error("[KEYGEN] Database error:", error);
+
+        restoreKey.run(nextKey.key);
 
         await interaction.editReply(
-            "Something went wrong while generating your key."
-        ).catch(() => {});
+            "⚠️ There was a database error. Contact an administrator."
+        );
     }
-});
-
-client.once("ready", () => {
-    const remaining = db.prepare(
-        "SELECT COUNT(*) AS count FROM available_keys"
-    ).get().count;
-
-    console.log(`[DISCORD] Logged in as ${client.user.tag}`);
-    console.log(`[KEYS] ${remaining} unused keys remaining.`);
 });
 
 async function start() {
-    try {
-        await registerCommands();
-        await client.login(TOKEN);
-    } catch (error) {
-        console.error("[STARTUP ERROR]", error);
-        process.exit(1);
-    }
+    server = app.listen(PORT, "0.0.0.0", () => {
+        console.log(`[WEB] Listening on port ${PORT}`);
+        startKeepAlive();
+    });
+
+    await rest.put(
+        Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+        { body: [generateCommand.toJSON()] }
+    );
+
+    console.log("[DISCORD] Slash commands registered.");
+
+    await client.login(DISCORD_TOKEN);
 }
 
-async function shutdown() {
-    console.log("[SHUTDOWN] Closing services.");
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
 
-    clearInterval(keepAliveTimer);
-    server.close();
+    console.log(`[SYSTEM] ${signal} received. Shutting down...`);
 
-    if (client.isReady()) {
-        client.destroy();
+    if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
     }
 
-    db.close();
+    if (server) {
+        await new Promise((resolve) => server.close(resolve));
+    }
+
+    client.destroy();
+
+    try {
+        db.close();
+    } catch (error) {
+        console.error("[DATABASE] Close error:", error.message);
+    }
+
     process.exit(0);
 }
 
-// Store the timer so it can be stopped during shutdown.
-const keepAliveTimer = setInterval(() => {}, 2147483647);
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
-process.once("SIGTERM", shutdown);
-process.once("SIGINT", shutdown);
-
-start();
+start().catch((error) => {
+    console.error("[STARTUP ERROR]", error);
+    process.exit(1);
+});
